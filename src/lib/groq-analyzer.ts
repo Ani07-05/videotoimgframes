@@ -1,14 +1,12 @@
 import Groq from 'groq-sdk';
 import fs from 'fs';
 import path from 'path';
-import sharp from 'sharp';
 
 const FRAMES_BASE_DIR = path.join(process.cwd(), 'frames');
 
 // Parallel processing settings
 const CONCURRENT_REQUESTS = 5; // Process 5 frames at a time
-const MAX_IMAGE_WIDTH = 1280; // Resize images to max 1280px width
-const JPEG_QUALITY = 70; // Compress to 70% quality
+const MAX_FILE_SIZE_MB = 4; // Skip files larger than 4MB
 
 export interface FrameAnalysis {
   frameId: string;
@@ -35,19 +33,6 @@ function getGroqClient(): Groq {
   return new Groq({ apiKey });
 }
 
-// Compress and resize image for faster API calls
-async function compressImage(imagePath: string): Promise<string> {
-  const imageBuffer = await sharp(imagePath)
-    .resize(MAX_IMAGE_WIDTH, null, {
-      withoutEnlargement: true,
-      fit: 'inside'
-    })
-    .jpeg({ quality: JPEG_QUALITY })
-    .toBuffer();
-
-  return imageBuffer.toString('base64');
-}
-
 export async function analyzeFrame(
   sessionId: string,
   frameName: string
@@ -59,8 +44,25 @@ export async function analyzeFrame(
     throw new Error(`Frame not found: ${framePath}`);
   }
 
-  // Compress image for faster upload/processing
-  const base64Image = await compressImage(framePath);
+  // Read image
+  const imageBuffer = fs.readFileSync(framePath);
+  const fileSizeMB = imageBuffer.length / (1024 * 1024);
+
+  // Skip large files
+  if (fileSizeMB > MAX_FILE_SIZE_MB) {
+    console.log(`[AI] · ${frameName} skipped (${fileSizeMB.toFixed(1)}MB > ${MAX_FILE_SIZE_MB}MB)`);
+    return {
+      frameId: frameName,
+      isPOCWorthy: false,
+      confidence: 0,
+      reason: 'Skipped - file too large',
+      category: 'other',
+      suggestedCaption: '',
+    };
+  }
+
+  const base64Image = imageBuffer.toString('base64');
+  const mimeType = frameName.endsWith('.png') ? 'image/png' : 'image/jpeg';
 
   // Shorter, more focused prompt for faster processing
   const prompt = `Analyze this pentest screenshot. Is it POC-worthy (shows vulnerability, auth bypass, sensitive data, or security issue)?
@@ -78,11 +80,11 @@ Reply JSON only:
           role: 'user',
           content: [
             { type: 'text', text: prompt },
-            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}` } },
           ],
         },
       ],
-      max_tokens: 256, // Reduced for faster response
+      max_tokens: 256,
       temperature: 0.2,
     });
 
@@ -122,28 +124,6 @@ Reply JSON only:
     console.error(`[AI] ✗ ${frameName}:`, error instanceof Error ? error.message : 'Error');
     throw error;
   }
-}
-
-// Process frames in parallel batches
-async function processInParallel<T, R>(
-  items: T[],
-  processor: (item: T) => Promise<R>,
-  concurrency: number
-): Promise<R[]> {
-  const results: R[] = [];
-
-  for (let i = 0; i < items.length; i += concurrency) {
-    const batch = items.slice(i, i + concurrency);
-    const batchResults = await Promise.allSettled(batch.map(processor));
-
-    for (const result of batchResults) {
-      if (result.status === 'fulfilled') {
-        results.push(result.value);
-      }
-    }
-  }
-
-  return results;
 }
 
 export async function analyzeBatch(

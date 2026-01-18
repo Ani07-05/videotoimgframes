@@ -36,6 +36,8 @@ export async function analyzeFrame(
   const groq = getGroqClient();
   const framePath = path.join(FRAMES_BASE_DIR, sessionId, frameName);
 
+  console.log(`[AI] Analyzing frame: ${frameName}`);
+
   if (!fs.existsSync(framePath)) {
     throw new Error(`Frame not found: ${framePath}`);
   }
@@ -44,6 +46,20 @@ export async function analyzeFrame(
   const imageBuffer = fs.readFileSync(framePath);
   const base64Image = imageBuffer.toString('base64');
   const mimeType = frameName.endsWith('.png') ? 'image/png' : 'image/jpeg';
+
+  // Check file size - Groq has 20MB limit per request
+  const fileSizeMB = imageBuffer.length / (1024 * 1024);
+  if (fileSizeMB > 15) {
+    console.log(`[AI] Frame ${frameName} is ${fileSizeMB.toFixed(2)}MB - skipping (too large)`);
+    return {
+      frameId: frameName,
+      isPOCWorthy: false,
+      confidence: 0,
+      reason: 'Frame skipped - file too large for analysis',
+      category: 'other',
+      suggestedCaption: '',
+    };
+  }
 
   const prompt = `You are a cybersecurity expert analyzing screenshots from a penetration test screen recording.
 This is for creating a POC (Proof of Concept) document for FTTH, AirFibre, and Hotspot security testing for a telecom company.
@@ -65,6 +81,9 @@ Respond in JSON format ONLY (no markdown):
 }`;
 
   try {
+    console.log(`[AI] Sending request to Groq for ${frameName}...`);
+    const startTime = Date.now();
+
     const response = await groq.chat.completions.create({
       model: 'meta-llama/llama-4-scout-17b-16e-instruct',
       messages: [
@@ -88,6 +107,9 @@ Respond in JSON format ONLY (no markdown):
       temperature: 0.3,
     });
 
+    const elapsed = Date.now() - startTime;
+    console.log(`[AI] Response received for ${frameName} in ${elapsed}ms`);
+
     const content = response.choices[0]?.message?.content || '';
 
     // Parse JSON response
@@ -97,6 +119,7 @@ Respond in JSON format ONLY (no markdown):
       const cleanContent = content.replace(/```json\n?|\n?```/g, '').trim();
       parsed = JSON.parse(cleanContent);
     } catch {
+      console.log(`[AI] Failed to parse JSON for ${frameName}, using fallback`);
       // If parsing fails, create a default response
       parsed = {
         isPOCWorthy: false,
@@ -108,7 +131,7 @@ Respond in JSON format ONLY (no markdown):
       };
     }
 
-    return {
+    const result = {
       frameId: frameName,
       isPOCWorthy: parsed.isPOCWorthy || false,
       confidence: parsed.confidence || 0.5,
@@ -117,8 +140,14 @@ Respond in JSON format ONLY (no markdown):
       suggestedCaption: parsed.suggestedCaption || '',
       technicalDetails: parsed.technicalDetails,
     };
+
+    if (result.isPOCWorthy) {
+      console.log(`[AI] ✓ POC-worthy: ${frameName} - ${result.category}: ${result.reason.substring(0, 50)}...`);
+    }
+
+    return result;
   } catch (error) {
-    console.error('Groq analysis error:', error);
+    console.error(`[AI] ✗ Error analyzing ${frameName}:`, error);
     throw new Error(`Failed to analyze frame: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
 }
@@ -128,11 +157,14 @@ export async function analyzeBatch(
   frameNames: string[],
   onProgress?: (current: number, total: number) => void
 ): Promise<BatchAnalysisResult> {
+  console.log(`[AI] Starting batch analysis of ${frameNames.length} frames for session ${sessionId}`);
+
   const analyzedFrames: FrameAnalysis[] = [];
   const suggestedPOCFrames: string[] = [];
 
   for (let i = 0; i < frameNames.length; i++) {
     try {
+      console.log(`[AI] Progress: ${i + 1}/${frameNames.length}`);
       const analysis = await analyzeFrame(sessionId, frameNames[i]);
       analyzedFrames.push(analysis);
 
@@ -144,15 +176,17 @@ export async function analyzeBatch(
         onProgress(i + 1, frameNames.length);
       }
 
-      // Rate limiting - Groq has limits
-      await new Promise(resolve => setTimeout(resolve, 500));
+      // Rate limiting - small delay between requests
+      if (i < frameNames.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
     } catch (error) {
-      console.error(`Failed to analyze frame ${frameNames[i]}:`, error);
+      console.error(`[AI] Failed to analyze frame ${frameNames[i]}:`, error);
       analyzedFrames.push({
         frameId: frameNames[i],
         isPOCWorthy: false,
         confidence: 0,
-        reason: 'Analysis failed',
+        reason: error instanceof Error ? error.message : 'Analysis failed',
         category: 'other',
         suggestedCaption: '',
       });
@@ -175,6 +209,8 @@ export async function analyzeBatch(
   const summary = `Analyzed ${frameNames.length} frames. Found ${pocCount} POC-worthy screenshots. ${
     categoryBreakdown ? `Categories: ${categoryBreakdown}` : ''
   }`;
+
+  console.log(`[AI] Batch analysis complete: ${summary}`);
 
   return {
     sessionId,
@@ -212,6 +248,8 @@ Provide:
 3. Brief narrative flow suggestions for the POC document
 
 Format as a clear, actionable recommendation.`;
+
+  console.log(`[AI] Generating POC suggestions for ${pocFrames.length} frames...`);
 
   const response = await groq.chat.completions.create({
     model: 'llama-3.3-70b-versatile',
